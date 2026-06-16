@@ -1,0 +1,10 @@
+title       = "jd"
+baseURL     = "https://jd-cli.tamnd.com/"
+description = "Fetch public JD.com product data from the command line"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/jd-cli"
