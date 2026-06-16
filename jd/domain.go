@@ -1,77 +1,77 @@
+// Copyright 2026 Duc-Tam Nguyen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package jd
 
 import (
 	"context"
-	"net/url"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes jd as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/jd-cli/jd"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// jd:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone jd binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the jd driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the JD.com driver for the kit framework.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme and identity used by both the standalone binary
+// and multi-domain hosts.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
-		Scheme: "jd",
-		Hosts:  []string{Host},
+		Scheme:  "jd",
+		Aliases: []string{"jingdong"},
+		Hosts:   []string{Host, "search.jd.com", "item.jd.com"},
 		Identity: kit.Identity{
 			Binary: "jd",
 			Short:  "Fetch public JD.com product data from the command line",
-			Long: `Fetch public JD.com product data from the command line
+			Long: `jd turns jd.com into a fast, scriptable command line.
 
-jd reads public jd data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+Search products from China's second largest e-commerce platform.
+No API key required: this CLI reads the same public pages your browser sees.
+
+Note: JD.com applies risk-based protection. Requests from datacenter IPs
+may be redirected to a verification page (exit 5). A residential IP helps.
+
+Quick start:
+  jd search "laptop"
+  jd search "笔记本电脑" --sort price-asc
+  jd search "手机" -n 60
+  jd search "耳机" -o jsonl`,
+			Site: "jd.com",
 			Repo: "https://github.com/tamnd/jd-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `jd page` and
-	// `ant get jd://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
-
-	// List op: members of a page, the home of `jd links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// jd://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "products",
+		Summary: "Search JD.com products",
+		Args:    []kit.Arg{{Name: "query", Help: "search query (Chinese or English)"}},
+	}, searchProducts)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,45 +82,27 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
-
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string  `kit:"arg"  help:"search query"`
+	Limit  int     `kit:"flag" help:"max results" default:"30"`
+	Sort   string  `kit:"flag" help:"sort: relevance|price-asc|price-desc|popularity|new" default:"relevance"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
-}
-
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchProducts(ctx context.Context, in searchInput, emit func(Product) error) error {
+	if strings.TrimSpace(in.Query) == "" {
+		return errs.Usage("query is required")
+	}
+	products, err := in.Client.Search(ctx, in.Query, in.Limit, in.Sort)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
+	for _, p := range products {
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -128,46 +110,61 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full jd.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns a JD product URL or SKU ID into (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized jd reference: %q", input)
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty input")
 	}
-	return "page", id, nil
+	// https://item.jd.com/1234567890.html
+	if strings.Contains(input, "item.jd.com/") {
+		parts := strings.Split(input, "item.jd.com/")
+		if len(parts) > 1 {
+			idPart := strings.TrimSuffix(parts[1], ".html")
+			idPart = strings.Split(idPart, "?")[0]
+			if idPart != "" {
+				return "product", idPart, nil
+			}
+		}
+	}
+	// bare numeric SKU
+	if isNumeric(input) {
+		return "product", input, nil
+	}
+	return "", "", errs.Usage("jd: unrecognized reference: %q", input)
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns the canonical JD URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "product":
+		return fmt.Sprintf("https://item.jd.com/%s.html", id), nil
+	default:
 		return "", errs.Usage("jd has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
 func mapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrBlocked) {
+		return errs.RateLimited("%s", err.Error())
+	}
+	if errors.Is(err, ErrNotFound) {
+		return errs.NotFound("%s", err.Error())
+	}
 	return err
+}
+
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

@@ -1,200 +1,349 @@
-// Package jd is the library behind the jd command line:
-// the HTTP client, request shaping, and the typed data models for jd.
+// Copyright 2026 Duc-Tam Nguyen
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package jd is the library behind the jd command line: the HTTP client,
+// HTML parsers, and typed data models for JD.com (京东).
+//
+// JD.com is China's second largest e-commerce platform. The search endpoint
+// at search.jd.com serves server-rendered HTML. Requests from datacenter IPs
+// often receive a 302 redirect to a risk handler; the client detects this and
+// returns ErrBlocked (exit code 5).
 package jd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to jd. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "jd/dev (+https://github.com/tamnd/jd-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at jd.com; change it once you
-// know the real endpoints you want to read.
+// Host is the primary search hostname.
 const Host = "jd.com"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// SearchHost is the hostname used for search requests.
+const SearchHost = "search.jd.com"
 
-// Client talks to jd over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// DefaultUserAgent is the browser User-Agent sent on every request.
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+// ErrBlocked is returned when the JD risk handler redirects the request.
+// Callers should map this to exit code 5.
+var ErrBlocked = errors.New("jd: request redirected to risk handler; try a residential IP or --proxy")
+
+// ErrNotFound is returned when a resource does not exist (HTTP 404).
+var ErrNotFound = errors.New("jd: not found")
+
+// Config holds constructor parameters for Client.
+type Config struct {
+	SearchURL string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
+}
 
+// DefaultConfig returns sensible defaults for jd.com.
+func DefaultConfig() Config {
+	return Config{
+		SearchURL: "https://search.jd.com",
+		UserAgent: DefaultUserAgent,
+		Rate:      1 * time.Second,
+		Retries:   3,
+		Timeout:   30 * time.Second,
+	}
+}
+
+// errBlockedRedirect is a sentinel used by CheckRedirect.
+var errBlockedRedirect = errors.New("jd: risk handler redirect detected")
+
+// Client is a rate-limited HTTP client for JD.com.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	transport := &http.Transport{
+		MaxIdleConns:        16,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	httpClient := &http.Client{
+		Timeout:   cfg.Timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if strings.Contains(req.URL.String(), "risk_handler") ||
+				strings.Contains(req.URL.Host, "cfe.m.jd.com") {
+				return errBlockedRedirect
+			}
+			if len(via) > 5 {
+				return errors.New("jd: too many redirects")
+			}
+			return nil
+		},
+	}
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		cfg:  cfg,
+		http: httpClient,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
+// Product is one search result from JD.com.
+type Product struct {
+	ID          string  `json:"id"`
+	Title       string  `json:"title"`
+	PriceFen    int64   `json:"price_fen"`   // price in fen (1/100 RMB); 0 if unknown
+	PriceYuan   float64 `json:"price_yuan"`  // price in yuan for display
+	Currency    string  `json:"currency"`    // always "CNY"
+	Shop        string  `json:"shop"`
+	ReviewCount int     `json:"review_count"`
+	URL         string  `json:"url"`
+	Image       string  `json:"image"`
+}
+
+// SortMap maps user-friendly sort names to JD sort parameters.
+var SortMap = map[string]string{
+	"relevance":  "",
+	"price-asc":  "price%23asc",
+	"price-desc": "price%23desc",
+	"popularity": "sale%23desc",
+	"new":        "newc%23desc",
+}
+
+// Search fetches products matching query. It paginates automatically to collect
+// up to limit results.
+func (c *Client) Search(ctx context.Context, query string, limit int, sort string) ([]Product, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+
+	var all []Product
+	for page := 1; len(all) < limit; page += 2 {
+		items, err := c.searchPage(ctx, query, page, sort)
+		if err != nil {
+			if len(all) > 0 {
+				break // already have results; stop silently
 			}
-		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
-		}
-		lastErr = err
-		if !retry {
 			return nil, err
 		}
-	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
-}
-
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
-func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
-	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
-	}
-	c.last = time.Now()
-}
-
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on jd.com. It is a stand-in for the typed records you
-// will model from the real jd endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `jd cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
+		all = append(all, items...)
+		if len(items) < 28 { // end of results (JD returns ~30 per page)
 			break
 		}
 	}
-	return out, nil
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
+}
+
+// searchPage fetches one page of search results.
+func (c *Client) searchPage(ctx context.Context, query string, page int, sort string) ([]Product, error) {
+	sortParam, ok := SortMap[sort]
+	if !ok {
+		sortParam = ""
+	}
+
+	u := fmt.Sprintf("%s/Search?keyword=%s&enc=utf-8&wq=%s&page=%d&click=0",
+		c.cfg.SearchURL,
+		url.QueryEscape(query),
+		url.QueryEscape(query),
+		page,
+	)
+	if sortParam != "" {
+		u += "&sort=" + sortParam
+	}
+
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	return parseSearch(body, "https://item.jd.com"), nil
 }
 
 var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
+	itemBlockRE   = regexp.MustCompile(`(?s)<li[^>]+class="[^"]*gl-item[^"]*"[^>]+data-sku="(\d+)"[^>]*>(.*?)</li>`)
+	priceRE       = regexp.MustCompile(`<i>([\d.,]+)</i>`)
+	titleAttrRE   = regexp.MustCompile(`class="p-name[^"]*"[\s\S]{0,400}?title="([^"]+)"`)
+	shopRE        = regexp.MustCompile(`class="p-shop"[\s\S]{0,600}?<a[^>]*>([^<]+)</a>`)
+	reviewCountRE = regexp.MustCompile(`>([\d,]+)条评价<`)
+	hrefRE        = regexp.MustCompile(`class="p-img"[\s\S]{0,400}?href="([^"]+)"`)
+	imgSrcRE      = regexp.MustCompile(`class="p-img"[\s\S]{0,500}?<img[^>]+src="([^"]+)"`)
 )
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+// parseSearch extracts products from JD search result HTML.
+func parseSearch(body []byte, baseURL string) []Product {
+	var products []Product
+	for _, m := range itemBlockRE.FindAllSubmatch(body, -1) {
+		id := string(m[1])
+		block := m[2]
+
+		p := Product{
+			ID:       id,
+			Currency: "CNY",
+			URL:      "https://item.jd.com/" + id + ".html",
 		}
+
+		if pm := priceRE.FindSubmatch(block); len(pm) > 1 {
+			p.PriceFen = parsePrice(string(pm[1]))
+			p.PriceYuan = float64(p.PriceFen) / 100
+		}
+		if tm := titleAttrRE.FindSubmatch(block); len(tm) > 1 {
+			p.Title = cleanTitle(string(tm[1]))
+		}
+		if sm := shopRE.FindSubmatch(block); len(sm) > 1 {
+			p.Shop = strings.TrimSpace(string(sm[1]))
+		}
+		if rcm := reviewCountRE.FindSubmatch(block); len(rcm) > 1 {
+			s := strings.ReplaceAll(string(rcm[1]), ",", "")
+			p.ReviewCount, _ = strconv.Atoi(s)
+		}
+		if hm := hrefRE.FindSubmatch(block); len(hm) > 1 {
+			p.URL = absURL(string(hm[1]))
+		}
+		if im := imgSrcRE.FindSubmatch(block); len(im) > 1 {
+			p.Image = absURL(string(im[1]))
+		}
+
+		products = append(products, p)
 	}
-	return out
+	return products
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// parsePrice converts "3,299.00" into fen (int64 cents * 100).
+func parsePrice(s string) int64 {
+	s = strings.ReplaceAll(s, ",", "")
+	f, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	return int64(f * 100)
+}
+
+var tagRE = regexp.MustCompile(`<[^>]+>`)
+
+// cleanTitle strips HTML tags and entities from a title string.
+func cleanTitle(s string) string {
+	s = tagRE.ReplaceAllString(s, "")
+	s = html.UnescapeString(s)
+	return strings.TrimSpace(s)
+}
+
+// absURL converts a protocol-relative or relative URL to absolute HTTPS.
+func absURL(href string) string {
+	if strings.HasPrefix(href, "//") {
+		return "https:" + href
 	}
-	return s
+	if strings.HasPrefix(href, "http") {
+		return href
+	}
+	return "https://www.jd.com" + href
+}
+
+// get fetches a URL with pacing and retry.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
+	var lastErr error
+	attempts := c.cfg.Retries
+	if attempts < 1 {
+		attempts = 1
+	}
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			wait := time.Duration(attempt-1) * 500 * time.Millisecond
+			if wait > 10*time.Second {
+				wait = 10 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+
+		c.pace()
+		body, code, err := c.do(rawURL)
+		if err != nil {
+			if errors.Is(err, errBlockedRedirect) {
+				return nil, ErrBlocked
+			}
+			lastErr = err
+			continue
+		}
+		if code == http.StatusNotFound {
+			return nil, ErrNotFound
+		}
+		if code == http.StatusTooManyRequests || code >= 500 {
+			lastErr = fmt.Errorf("http %d", code)
+			continue
+		}
+		if code == http.StatusFound || code == http.StatusMovedPermanently {
+			// A redirect we didn't intercept
+			lastErr = fmt.Errorf("http %d (unexpected redirect)", code)
+			continue
+		}
+		if code != http.StatusOK {
+			return nil, fmt.Errorf("http %d", code)
+		}
+		return body, nil
+	}
+	return nil, fmt.Errorf("get %s after %d attempts: %w", rawURL, attempts, lastErr)
+}
+
+func (c *Client) do(rawURL string) ([]byte, int, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+	req.Header.Set("Referer", "https://www.jd.com/")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		// Detect blocked redirect via URL errors wrapping errBlockedRedirect
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && errors.Is(urlErr.Err, errBlockedRedirect) {
+			return nil, 0, errBlockedRedirect
+		}
+		return nil, 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return body, resp.StatusCode, nil
+}
+
+func (c *Client) pace() {
+	if c.cfg.Rate <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
+		time.Sleep(wait)
+	}
+	c.last = time.Now()
 }
